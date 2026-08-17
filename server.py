@@ -2,6 +2,7 @@
 """MonarchMoney MCP Server - Provides access to Monarch Money financial data via MCP protocol."""
 
 import asyncio
+import base64
 import contextlib
 import functools
 import io
@@ -11,10 +12,11 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -32,8 +34,8 @@ from mcp.types import (
     ResourceTemplateReference,
     ToolAnnotations,
 )
-from monarchmoney import MonarchMoney, RequireMFAException
-from pydantic import BaseModel, ConfigDict, JsonValue
+from monarchmoney import CaptchaRequiredException, LoginFailedException, MonarchMoney, RequireMFAException
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 # Type definitions for Monarch Money API responses
 JsonSerializable = str | int | float | bool | None | list["JsonSerializable"] | dict[str, "JsonSerializable"]
@@ -700,6 +702,37 @@ class SpendingPatterns(MMModel):
     metadata: JsonValue = None
 
 
+class AuthResult(BaseModel):
+    """Outcome of an interactive authentication action."""
+
+    success: bool
+    message: str
+
+
+# Elicitation schemas for interactive login (MCP forms). Field descriptions
+# become the labels/help text the client renders, so credentials flow
+# client-UI -> server directly over the protocol and never appear in tool
+# arguments or this conversation.
+
+
+class LoginForm(BaseModel):
+    email: str = Field(description="Monarch Money email address")
+    password: str = Field(description="Monarch Money password")
+
+
+class MFACodeForm(BaseModel):
+    code: str = Field(description="Monarch Money MFA code, or the verification code Monarch emailed you")
+
+
+class CookieForm(BaseModel):
+    cookie_header: str = Field(
+        description=(
+            "Cookie header value copied from a logged-in browser session at app.monarch.com "
+            "(DevTools → Network → any api.monarch.com request → Request Headers → 'cookie')"
+        )
+    )
+
+
 # =============================================================================
 # MCP Resources - Read-only data endpoints for reference data
 # =============================================================================
@@ -958,6 +991,153 @@ session_dir = Path(_session_dir_env).expanduser() if _session_dir_env else Path.
 session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 session_file = session_dir / "session.pickle"
 
+# Keyring-first session storage, falling back to the file above.
+#
+# Monarch's login now sits behind Cloudflare CAPTCHA and can require an
+# emailed one-time code even with MFA disabled, so a fresh non-interactive
+# login is not always possible. Once a session IS established (via env-var
+# login, the scripts/login_setup.py script, or the interactive monarch_login tools
+# below) it's reused for as long as possible rather than re-attempted, and
+# stored in the OS keychain when one is available rather than in plaintext.
+KEYRING_SERVICE = "monarch-mcp"
+KEYRING_USERNAME = "session"
+_KEYRING_PROBE_USERNAME = "__probe__"
+
+
+def _keyring_available() -> bool:
+    """Probe whether the active keyring backend can actually round-trip a value.
+
+    Headless Linux and CI containers commonly have the ``keyring`` package
+    installed but no working Secret Service / keychain daemon behind it, so
+    an import check alone isn't enough — we set + get + delete a sentinel
+    and trust the backend only if every step succeeds.
+    """
+    try:
+        import keyring
+    except ImportError:
+        return False
+
+    try:
+        keyring.set_password(KEYRING_SERVICE, _KEYRING_PROBE_USERNAME, "1")
+        stored = keyring.get_password(KEYRING_SERVICE, _KEYRING_PROBE_USERNAME)
+        keyring.delete_password(KEYRING_SERVICE, _KEYRING_PROBE_USERNAME)
+    except Exception:
+        return False
+
+    return stored == "1"
+
+
+@contextlib.contextmanager
+def suppressed_output() -> Iterator[None]:
+    """Suppress stdout/stderr around third-party calls that may print.
+
+    Any stray print to stdout corrupts the MCP JSON-RPC stdio stream, so
+    every call into the monarchmoney library that touches disk or network
+    I/O is wrapped with this.
+    """
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        yield
+
+
+def _session_bytes_from_client(client: MonarchMoney) -> bytes:
+    """Serialize a client's session via its own save_session(), off a scratch file."""
+    fd, tmp_path = tempfile.mkstemp(prefix="session-", dir=str(session_dir))
+    os.close(fd)
+    try:
+        with suppressed_output():
+            client.save_session(tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _client_from_session_bytes(blob: bytes) -> MonarchMoney:
+    """Reconstruct a client from bytes produced by _session_bytes_from_client()."""
+    fd, tmp_path = tempfile.mkstemp(prefix="session-", dir=str(session_dir))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(blob)
+        client = MonarchMoney()
+        with suppressed_output():
+            client.load_session(tmp_path)
+        return client
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def has_saved_session() -> bool:
+    """Check whether a session is saved, without materializing a client."""
+    if _keyring_available():
+        try:
+            import keyring
+
+            if keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) is not None:
+                return True
+        except Exception:
+            pass
+    return session_file.exists()
+
+
+def save_session_secure(client: MonarchMoney) -> None:
+    """Persist an authenticated session, preferring the OS keyring over disk."""
+    blob = _session_bytes_from_client(client)
+
+    if _keyring_available():
+        try:
+            import keyring
+
+            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, base64.b64encode(blob).decode())
+            # Avoid leaving a stale plaintext copy around once the keyring has it.
+            session_file.unlink(missing_ok=True)
+            log.info("auth_session_saved", backend="keyring")
+            return
+        except Exception as e:
+            log.warning("auth_keyring_save_failed", error=str(e))
+
+    session_file.write_bytes(blob)
+    session_file.chmod(0o600)
+    log.info("auth_session_saved", backend="file")
+
+
+def load_session_secure() -> MonarchMoney | None:
+    """Load a previously saved session, preferring the OS keyring over disk."""
+    if _keyring_available():
+        try:
+            import keyring
+
+            raw = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+            if raw:
+                return _client_from_session_bytes(base64.b64decode(raw))
+        except Exception as e:
+            log.warning("auth_keyring_load_failed", error=str(e))
+
+    if session_file.exists():
+        try:
+            return _client_from_session_bytes(session_file.read_bytes())
+        except Exception as e:
+            log.warning("auth_session_load_failed", error=str(e))
+
+    return None
+
+
+def clear_session_secure(reason: str = "unknown") -> None:
+    """Remove any saved session from both the keyring and disk."""
+    if _keyring_available():
+        try:
+            import keyring
+
+            keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
+        except Exception as e:
+            log.warning("auth_keyring_clear_failed", error=str(e))
+
+    for path in [session_file, session_dir / "mm_session.pickle"]:
+        if path.exists():
+            try:
+                path.unlink()
+                log.info("session_file_cleared", path=str(path), reason=reason)
+            except Exception as e:
+                log.warning("session_file_clear_failed", path=str(path), error=str(e))
+
 
 def is_auth_error(error: Exception) -> bool:
     """Determine if an error is a genuine authentication/authorization failure.
@@ -1003,10 +1183,10 @@ def is_auth_error(error: Exception) -> bool:
 
 
 def clear_session(reason: str = "unknown") -> None:
-    """Clear session files and reset authentication state to allow fresh re-authentication.
+    """Clear the saved session and reset authentication state to allow fresh re-authentication.
 
     This function performs a complete authentication reset:
-    - Clears session files from disk (.mm/session.pickle, .mm/mm_session.pickle)
+    - Clears the saved session from the keyring and disk (see clear_session_secure())
     - Resets the client instance (mm_client = None)
     - Resets auth state to NOT_INITIALIZED
     - Clears auth errors and failure timestamps
@@ -1020,21 +1200,12 @@ def clear_session(reason: str = "unknown") -> None:
 
     log.info("auth_reset", reason=reason, previous_state=auth_state.value)
 
-    if mm_client is not None:
-        mm_client = None
-
+    mm_client = None
     auth_state = AuthState.NOT_INITIALIZED
     auth_error = None
     auth_failed_at = None
 
-    # Clear session files
-    for path in [session_file, session_dir / "mm_session.pickle"]:
-        if path.exists():
-            try:
-                path.unlink()
-                log.info("session_file_cleared", path=str(path))
-            except Exception as e:
-                log.warning("session_file_clear_failed", path=str(path), error=str(e))
+    clear_session_secure(reason=reason)
 
 
 async def api_call_with_retry(method_name: str, *args: Any, max_retries: int = 3, **kwargs: Any) -> Any:
@@ -1115,18 +1286,42 @@ async def api_call_with_retry(method_name: str, *args: Any, max_retries: int = 3
 async def initialize_client() -> None:
     """Initialize the MonarchMoney client with authentication.
 
-    This function attempts to use cached sessions when possible and only
-    performs fresh authentication when necessary. It does NOT validate
-    sessions immediately - validation happens on first API call.
+    Prefers a previously saved session (OS keyring, falling back to a
+    permissioned file) over a fresh password login: Monarch's login can sit
+    behind a Cloudflare CAPTCHA or require an emailed one-time code even
+    with MFA disabled, neither of which a headless retry can satisfy, so an
+    already-established session is reused for as long as possible rather
+    than re-attempted. Falls back to MONARCH_EMAIL/MONARCH_PASSWORD (and
+    optionally MONARCH_MFA_SECRET for TOTP) for a fresh non-interactive
+    login when no saved session exists. When that's blocked by CAPTCHA or a
+    non-TOTP MFA challenge, use `scripts/login_setup.py` or the `monarch_login` /
+    `monarch_login_with_cookies` MCP tools instead.
     """
     global mm_client, auth_state, auth_error, auth_failed_at
+
+    force_login = os.getenv("MONARCH_FORCE_LOGIN") == "true"
+    if force_login:
+        log.info("auth_force_login")
+        clear_session_secure(reason="forced login requested")
+    else:
+        saved_client = load_session_secure()
+        if saved_client is not None:
+            mm_client = saved_client
+            auth_state = AuthState.AUTHENTICATED
+            auth_error = None
+            log.info("auth_session_loaded")
+            return
 
     email = os.getenv("MONARCH_EMAIL")
     password = os.getenv("MONARCH_PASSWORD")
     mfa_secret = os.getenv("MONARCH_MFA_SECRET")
 
     if not email or not password:
-        error_msg = "MONARCH_EMAIL and MONARCH_PASSWORD environment variables are required"
+        error_msg = (
+            "No saved Monarch Money session found, and MONARCH_EMAIL/MONARCH_PASSWORD "
+            "are not set. Run `uv run scripts/login_setup.py` from the repo, or call the "
+            "`monarch_login` MCP tool to sign in interactively."
+        )
         log.error("auth_missing_credentials")
         auth_state = AuthState.FAILED
         auth_error = error_msg
@@ -1135,29 +1330,6 @@ async def initialize_client() -> None:
     log.info("auth_init", email=email)
     mm_client = MonarchMoney()
 
-    # Try to load existing session first (unless forced to skip)
-    force_login = os.getenv("MONARCH_FORCE_LOGIN") == "true"
-    if session_file.exists() and not force_login:
-        try:
-            stdout_capture = io.StringIO()
-            stderr_capture = io.StringIO()
-            with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-                mm_client.load_session(str(session_file))
-
-            log.info("auth_session_loaded", session_file=str(session_file))
-            auth_state = AuthState.AUTHENTICATED
-            return
-
-        except Exception as e:
-            log.warning("auth_session_load_failed", error=str(e))
-            if is_auth_error(e):
-                clear_session(reason="invalid session file")
-
-    else:
-        if force_login:
-            log.info("auth_force_login")
-            clear_session(reason="forced login requested")
-
     # Perform fresh authentication
     max_retries = 2
     retry_delay = 3
@@ -1165,27 +1337,41 @@ async def initialize_client() -> None:
     for attempt in range(max_retries):
         try:
             log.info("auth_login_attempt", attempt=attempt + 1, max_retries=max_retries, mfa=bool(mfa_secret))
-            if mfa_secret:
-                await mm_client.login(email, password, mfa_secret_key=mfa_secret, use_saved_session=False)
-            else:
-                await mm_client.login(email, password, use_saved_session=False)
+            with suppressed_output():
+                if mfa_secret:
+                    await mm_client.login(
+                        email, password, mfa_secret_key=mfa_secret, use_saved_session=False, save_session=False
+                    )
+                else:
+                    await mm_client.login(email, password, use_saved_session=False, save_session=False)
 
-            # Save session with stdout/stderr suppression
-            stdout_capture = io.StringIO()
-            stderr_capture = io.StringIO()
-            with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-                mm_client.save_session(str(session_file))
-
-            if session_file.exists():
-                session_file.chmod(0o600)
+            save_session_secure(mm_client)
 
             auth_state = AuthState.AUTHENTICATED
             auth_error = None
             log.info("auth_success")
             return
 
+        except CaptchaRequiredException as e:
+            error_msg = (
+                "Monarch blocked this login attempt with a CAPTCHA challenge, which can't "
+                "be solved headlessly. Run `uv run scripts/login_setup.py` from the repo and choose "
+                "the browser-cookie option, or call the `monarch_login_with_cookies` MCP "
+                "tool to paste a Cookie header from a logged-in browser session."
+            )
+            log.error("auth_captcha_required")
+            auth_state = AuthState.FAILED
+            auth_error = error_msg
+            auth_failed_at = time.time()
+            raise ValueError(error_msg) from e
+
         except RequireMFAException as e:
-            error_msg = "Multi-factor authentication required but MONARCH_MFA_SECRET not set"
+            error_msg = (
+                "Multi-factor authentication (or an emailed verification code) is required "
+                "but MONARCH_MFA_SECRET is not set — and an emailed code can't be satisfied "
+                "by a TOTP secret anyway. Run `uv run scripts/login_setup.py` from the repo, or call "
+                "the `monarch_login` MCP tool to complete it interactively."
+            )
             log.error("auth_mfa_required")
             auth_state = AuthState.FAILED
             auth_error = error_msg
@@ -2522,6 +2708,151 @@ async def analyze_spending_patterns(
     except Exception as e:
         log.error("Failed to analyze spending patterns", error=str(e), lookback_months=lookback_months)
         raise
+
+
+# =============================================================================
+# Authentication tools
+#
+# Establish or clear a session interactively, for when MONARCH_EMAIL /
+# MONARCH_PASSWORD login (in initialize_client()) can't complete headlessly —
+# e.g. Monarch's Cloudflare CAPTCHA gate, or an MFA/emailed verification code
+# with no MONARCH_MFA_SECRET configured. A session established this way is
+# saved via save_session_secure() and reused by every other tool exactly
+# like one from the env-var login path.
+# =============================================================================
+
+
+async def _activate_session(client: MonarchMoney) -> None:
+    """Save a freshly authenticated client and make it the active session."""
+    global mm_client, auth_state, auth_lock, auth_error, auth_failed_at
+
+    save_session_secure(client)
+
+    if auth_lock is None:
+        auth_lock = asyncio.Lock()
+    async with auth_lock:
+        mm_client = client
+        auth_state = AuthState.AUTHENTICATED
+        auth_error = None
+        auth_failed_at = None
+
+
+@mcp.tool(annotations=WRITE_SIDE_EFFECT, title="Sign In To Monarch Money")
+async def monarch_login(ctx: Context) -> AuthResult:
+    """Sign in to Monarch Money interactively.
+
+    Opens a form in the client UI to collect email and password, followed by
+    an MFA/emailed-code form if Monarch requires one. Credentials flow
+    client-UI → server directly over the MCP protocol and never appear in
+    tool arguments or this conversation. Use this when the env-var login
+    fails with an MFA or emailed-verification-code error; if it fails with a
+    CAPTCHA error, use `monarch_login_with_cookies` instead.
+    """
+    if not hasattr(ctx, "elicit"):
+        return AuthResult(
+            success=False,
+            message="Interactive login requires MCP elicitation support (mcp>=1.10.0) in your client.",
+        )
+
+    form = await ctx.elicit(message="Sign in to Monarch Money.", schema=LoginForm)
+    if form.action != "accept" or form.data is None:
+        return AuthResult(success=False, message="Login cancelled.")
+
+    client = MonarchMoney()
+    try:
+        with suppressed_output():
+            await client.login(form.data.email, form.data.password, use_saved_session=False, save_session=False)
+    except RequireMFAException:
+        mfa = await ctx.elicit(
+            message="Enter your Monarch Money MFA code, or the verification code Monarch emailed you.",
+            schema=MFACodeForm,
+        )
+        if mfa.action != "accept" or mfa.data is None:
+            return AuthResult(success=False, message="Login cancelled.")
+        try:
+            with suppressed_output():
+                await client.multi_factor_authenticate(form.data.email, form.data.password, mfa.data.code)
+        except CaptchaRequiredException:
+            return AuthResult(
+                success=False,
+                message="Monarch blocked this login with a CAPTCHA challenge. Use `monarch_login_with_cookies` instead.",
+            )
+        except (LoginFailedException, RequireMFAException) as e:
+            return AuthResult(success=False, message=f"Login failed: {e}")
+    except CaptchaRequiredException:
+        return AuthResult(
+            success=False,
+            message="Monarch blocked this login with a CAPTCHA challenge. Use `monarch_login_with_cookies` instead.",
+        )
+    except LoginFailedException as e:
+        return AuthResult(success=False, message=f"Login failed: {e}")
+
+    await _activate_session(client)
+    log.info("auth_success", method="interactive")
+    return AuthResult(success=True, message="Signed in. Session saved securely for future tool calls.")
+
+
+@mcp.tool(annotations=WRITE_SIDE_EFFECT, title="Sign In With Browser Cookies")
+async def monarch_login_with_cookies(ctx: Context) -> AuthResult:
+    """Sign in to Monarch Money using cookies copied from a logged-in browser.
+
+    Bypasses the Cloudflare CAPTCHA gate that can block programmatic login
+    entirely, and works for SSO accounts that can't use password login.
+    Grab the 'cookie' request header from DevTools → Network on any
+    api.monarch.com request while logged in at app.monarch.com.
+    """
+    if not hasattr(ctx, "elicit"):
+        return AuthResult(
+            success=False,
+            message="Interactive login requires MCP elicitation support (mcp>=1.10.0) in your client.",
+        )
+
+    form = await ctx.elicit(message="Paste your Monarch Money browser Cookie header.", schema=CookieForm)
+    if form.action != "accept" or form.data is None:
+        return AuthResult(success=False, message="Login cancelled.")
+
+    cookie_header = form.data.cookie_header.strip()
+    if not cookie_header:
+        return AuthResult(success=False, message="Empty cookie value — aborting.")
+
+    client = MonarchMoney()
+    try:
+        with suppressed_output():
+            await client.login_with_cookies(cookie_header, save_session=False, verify=True)
+    except LoginFailedException as e:
+        return AuthResult(success=False, message=f"Cookie login failed: {e}")
+
+    await _activate_session(client)
+    log.info("auth_success", method="cookies")
+    return AuthResult(
+        success=True, message="Signed in with browser cookies. Session saved securely for future tool calls."
+    )
+
+
+@mcp.tool(annotations=WRITE_SIDE_EFFECT, title="Sign Out Of Monarch Money")
+async def monarch_logout() -> AuthResult:
+    """Clear the saved Monarch Money session (both keyring and on-disk fallback)."""
+    clear_session(reason="user requested logout")
+    return AuthResult(success=True, message="Signed out. Saved session cleared.")
+
+
+@mcp.tool(annotations=READONLY, title="Check Authentication Status")
+async def check_auth_status() -> AuthResult:
+    """Report whether a Monarch Money session is currently active or saved."""
+    if auth_state == AuthState.AUTHENTICATED and mm_client is not None:
+        return AuthResult(success=True, message="Authenticated for this session.")
+    if has_saved_session():
+        return AuthResult(
+            success=True,
+            message="A saved session exists and will be used automatically on the next tool call.",
+        )
+    return AuthResult(
+        success=False,
+        message=(
+            "Not authenticated. Call `monarch_login` (or `monarch_login_with_cookies` if you're "
+            "being CAPTCHA-blocked), or run `uv run scripts/login_setup.py` from the repo."
+        ),
+    )
 
 
 async def main() -> None:

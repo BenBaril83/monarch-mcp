@@ -30,7 +30,8 @@ Use generic, obviously-fake examples instead: "Main Credit Card", "Corner Deli",
 - `MONARCH_FORCE_LOGIN=true uv run python server.py` - Force fresh login (if session expires)
 
 ### Debugging Startup Issues (Updated July 2025)
-- **Session expired**: Delete `~/.monarch-mcp/session.pickle` or set `MONARCH_FORCE_LOGIN=true`
+- **Session expired**: Call `monarch_logout`, delete `~/.monarch-mcp/session.pickle`, or set `MONARCH_FORCE_LOGIN=true`
+- **CAPTCHA / MFA / emailed one-time code blocks login**: Non-interactive login can't solve these. Run `uv run scripts/login_setup.py`, or call the `monarch_login`/`monarch_login_with_cookies` MCP tools
 - **JSON parse errors**: Fixed - all stdout output suppressed with `contextlib.redirect_stdout()`
 - **MCP protocol compliance**: All logging/warnings redirected to stderr, third-party lib output suppressed
 - **AsyncIO errors**: Fixed - uses `run_stdio_async()` in async context
@@ -166,12 +167,13 @@ refactor: split server.py into modular components (auth, tools, models)
 - Automatic capability negotiation and tool discovery
 
 **Secure Authentication & Session Management**
-- Sessions stored in `~/.monarch-mcp/` directory (override via `MONARCH_SESSION_DIR`) with 0700 permissions  
-- Proper `RequireMFAException` handling
+- Non-interactive login via `MONARCH_EMAIL`/`MONARCH_PASSWORD`/`MONARCH_MFA_SECRET` env vars remains the primary path (`initialize_client()`), handling TOTP MFA via `mfa_secret_key`.
+- Monarch's login can also sit behind a Cloudflare CAPTCHA (`CaptchaRequiredException`) or require an emailed one-time code (raised as `RequireMFAException` by our fork, indistinguishable from TOTP MFA at that layer) — neither satisfiable headlessly. `initialize_client()` surfaces an actionable error for both pointing at the interactive paths below, instead of a generic failure.
+- **Interactive escape hatch**: `monarch_login` / `monarch_login_with_cookies` MCP tools (using `Context.elicit` — credentials flow client-UI → server, never through tool arguments or the model) and `scripts/login_setup.py` (terminal script for repo clones: browser-cookie / password+MFA / token-paste paths). `monarch_logout` clears the session; `check_auth_status` reports whether one is active or saved.
+- **Session storage**: keyring-first (`save_session_secure()`/`load_session_secure()`/`clear_session_secure()` in `server.py`), via the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service) when a real backend is available — probed with a set/get/delete round-trip (`_keyring_available()`), since headless environments often have the `keyring` package but no working backend. Falls back to a 0600 file under `~/.monarch-mcp/` (override via `MONARCH_SESSION_DIR`) otherwise. The blob itself is produced via the monarchmoney client's own `save_session()`/`load_session()` (off a scratch temp file), so it stores whatever the library's session format is (token and/or cookies), not a bespoke format.
 - Structured logging with `structlog` for debugging
-- Environment variables: `MONARCH_EMAIL`, `MONARCH_PASSWORD`, `MONARCH_MFA_SECRET`
 
-**Complete Monarch Money API Coverage (21 Tools)**
+**Complete Monarch Money API Coverage (25 Tools)**
 - **Core**: `get_accounts`, `get_transactions`, `get_budgets`, `get_cashflow`
 - **Categories**: `get_transaction_categories`
 - **Transactions**: `create_transaction`, `update_transaction`, `update_transactions_bulk`, `search_transactions`
@@ -182,6 +184,7 @@ refactor: split server.py into modular components (auth, tools, models)
 - **Manual**: `create_manual_account`
 - **Batch Operations**: `get_spending_summary`, `update_transactions_bulk`
 - **Intelligent Analysis**: `get_complete_financial_overview`, `analyze_spending_patterns`
+- **Authentication**: `monarch_login`, `monarch_login_with_cookies`, `monarch_logout`, `check_auth_status`
 
 Also exposes 5 MCP resources (3 static lists + 2 parameterized templates: `accounts://{account_id}/holdings|history`) and 4 prompt templates.
 
@@ -238,9 +241,10 @@ Published to PyPI as `monarch-mcp-jamiew` and to the MCP Registry as `io.github.
 
 ### Session Management
 
-- Session files stored in `~/.monarch-mcp/` directory (created automatically; override via `MONARCH_SESSION_DIR`)
+- Sessions save to the OS keyring first, falling back to a 0600 file under `~/.monarch-mcp/` (created automatically; override via `MONARCH_SESSION_DIR`) when no keyring backend is available
 - Session invalidation handled gracefully with automatic re-authentication
 - Use `MONARCH_FORCE_LOGIN=true` to bypass session cache for debugging
+- When non-interactive login can't complete (CAPTCHA, MFA/email-OTP without `MONARCH_MFA_SECRET`), use `scripts/login_setup.py` or the `monarch_login`/`monarch_login_with_cookies` MCP tools to establish a session once; every tool call reuses it afterward
 - Sessions follow Monarch Money API session management patterns
 
 ## Status & Achievements
@@ -254,14 +258,14 @@ Published to PyPI as `monarch-mcp-jamiew` and to the MCP Registry as `io.github.
 - **✅ Structured Logging**: Context-rich logs with `structlog`
 - **✅ Complete API Coverage**: All 14 Monarch Money API methods as tools
 
-#### Quality Metrics (Updated May 2026)
-- **206 passing tests** with comprehensive coverage including analytics, search, bulk operations, splits, structured output, completions, resource templates, and progress
-- **21 tools** (all returning typed Pydantic models / structured output), 3 static resources + 2 resource templates, 4 prompts
+#### Quality Metrics (Updated August 2026)
+- **227 passing tests** with comprehensive coverage including analytics, search, bulk operations, splits, structured output, completions, resource templates, progress, and interactive/keyring authentication
+- **25 tools** (all returning typed Pydantic models / structured output), 3 static resources + 2 resource templates, 4 prompts
 - **MyPy clean** under the repo's strict config (no `Any` at non-boundaries, no `as`)
 - **Security**: Proper session handling and MFA support
 - **Modern stack**: FastMCP 1.12.2, Pydantic, structlog, pytest
 - **Usage analytics**: Real-time performance tracking and optimization suggestions
-- **Codebase**: 1,447 lines in server.py, 7 test files with comprehensive coverage
+- **Codebase**: ~2,900 lines in server.py, plus `scripts/login_setup.py` for interactive terminal auth; 19 test files with comprehensive coverage
 
 ### ✅ ADVANCED FEATURES (Recently Completed)
 
@@ -400,7 +404,7 @@ Published to PyPI as `monarch-mcp-jamiew` and to the MCP Registry as `io.github.
 5. **Phase 5 (Intelligence)**: ML features, advanced analytics, financial insights
 6. **Phase 6 (Ecosystem)**: MCP extensions, developer tools, architectural improvements
 
-**Current Status** (Updated June 2026): Production-ready with 206 passing tests, 21 intelligent tools (including transaction splitting via `get_transaction_splits` / `update_transaction_splits`), comprehensive analytics, robust error handling, and enhanced reliability. Recent MCP modernization: every tool returns structured output (outputSchema + structured content with a text fallback), tools/resources/prompts carry human-friendly `title`s, parameterized resource templates (`accounts://{account_id}/holdings|history`), argument completions for prompts/templates, and Context-based progress reporting on the batch tools. Earlier features: `update_transactions_bulk()` for parallel batch updates, `search_transactions`, result-size tracking; fixes for the auth retry bug, date serialization, broken pipes, and date parsing. Note: `get_account_holdings` now requires an `account_id` (the underlying library always did).
+**Current Status** (Updated August 2026): Production-ready with 227 passing tests, 25 intelligent tools (including transaction splitting via `get_transaction_splits` / `update_transaction_splits`), comprehensive analytics, robust error handling, and enhanced reliability. Recent: interactive authentication (`monarch_login`, `monarch_login_with_cookies`, `monarch_logout`, `check_auth_status` tools plus `scripts/login_setup.py`) and keyring-first session storage, added so a Cloudflare CAPTCHA gate or an MFA/emailed one-time code doesn't strand headless env-var login — see "Secure Authentication & Session Management" above. Earlier MCP modernization: every tool returns structured output (outputSchema + structured content with a text fallback), tools/resources/prompts carry human-friendly `title`s, parameterized resource templates (`accounts://{account_id}/holdings|history`), argument completions for prompts/templates, and Context-based progress reporting on the batch tools. Earlier features: `update_transactions_bulk()` for parallel batch updates, `search_transactions`, result-size tracking; fixes for the auth retry bug, date serialization, broken pipes, and date parsing. Note: `get_account_holdings` now requires an `account_id` (the underlying library always did).
 
 ## Upstream Library & Fork Landscape
 

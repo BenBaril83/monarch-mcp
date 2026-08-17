@@ -27,6 +27,7 @@ classifiers = [
     "Topic :: Office/Business :: Financial",
 ]
 dependencies = [
+    "keyring>=24.0.0",
     "mcp[cli]>=1.28.0,<2",
     "monarchmoneycommunity>=1.4.0",
     "pydantic>=2.12.5",

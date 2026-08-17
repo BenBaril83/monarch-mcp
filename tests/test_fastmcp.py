@@ -1,6 +1,6 @@
 """Tests for FastMCP server implementation."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -36,7 +36,7 @@ class TestFastMCPServer:
     @pytest.mark.asyncio
     async def test_initialize_client_missing_credentials(self) -> None:
         """Test client initialization fails with missing credentials."""
-        with pytest.raises(ValueError, match="MONARCH_EMAIL and MONARCH_PASSWORD"):
+        with pytest.raises(ValueError, match="MONARCH_EMAIL/MONARCH_PASSWORD"):
             await server.initialize_client()
 
     @patch.dict("os.environ", {"MONARCH_EMAIL": "test@example.com", "MONARCH_PASSWORD": "testpass"})
@@ -44,8 +44,12 @@ class TestFastMCPServer:
     @pytest.mark.asyncio
     async def test_initialize_client_success(self, mock_monarch_class: AsyncMock) -> None:
         """Test successful client initialization."""
-        # Setup mock
+        # Setup mock. save_session/load_session are sync in the real client, so give
+        # them non-async mocks — AsyncMock defaults every attribute to a coroutine,
+        # which would otherwise leave save_session's return value un-awaited.
         mock_client = AsyncMock()
+        mock_client.save_session = MagicMock()
+        mock_client.load_session = MagicMock()
         mock_monarch_class.return_value = mock_client
 
         # Reset global client
