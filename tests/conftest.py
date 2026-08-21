@@ -1,11 +1,26 @@
 """Shared pytest fixtures for the test suite."""
 
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 import server
+
+
+@pytest.fixture(autouse=True)
+def _isolated_session_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point session storage at a scratch dir so tests never touch a real ~/.monarch-mcp.
+
+    Without this, any test that exercises initialize_client()/save_session_secure()
+    without explicitly mocking server.session_file would read or write the real,
+    developer-machine session file.
+    """
+    session_dir = tmp_path / ".monarch-mcp"
+    session_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(server, "session_dir", session_dir)
+    monkeypatch.setattr(server, "session_file", session_dir / "session.pickle")
 
 
 @pytest.fixture(autouse=True)

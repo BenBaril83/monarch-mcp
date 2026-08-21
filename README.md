@@ -201,6 +201,10 @@ Then point your client at the local copy with absolute paths (find them with `wh
 | `get_spending_summary` | Spending aggregated by category, account, or month |
 | `get_complete_financial_overview` | Combined 5-API call in parallel |
 | `analyze_spending_patterns` | Multi-month trend analysis |
+| `monarch_login` | Interactive sign-in (email/password + MFA) when env-var login can't complete |
+| `monarch_login_with_cookies` | Interactive sign-in via a pasted browser cookie, bypasses CAPTCHA |
+| `monarch_logout` | Clear the saved session |
+| `check_auth_status` | Check whether a session is active or saved |
 
 ### Transaction format
 
@@ -224,11 +228,20 @@ By default, transactions return a compact format with the fields that matter:
 
 ## Session management
 
-Sessions are cached in `~/.monarch-mcp/` for faster subsequent logins (override the location with the `MONARCH_SESSION_DIR` env var). If you hit auth issues:
+Sessions are cached for faster subsequent logins — in your OS keychain when one is available (macOS Keychain, Windows Credential Manager, or a Linux Secret Service like GNOME Keyring/KWallet), falling back automatically to a permissioned file under `~/.monarch-mcp/` when there's no keyring backend (e.g. a headless server or container). Override the fallback location with the `MONARCH_SESSION_DIR` env var. If you hit auth issues:
 
-- Delete `~/.monarch-mcp/session.pickle` to clear the cached session
+- Call the `monarch_logout` tool, or delete `~/.monarch-mcp/session.pickle`, to clear the cached session
 - Set `MONARCH_FORCE_LOGIN=true` in your env config to force a fresh login
 - Make sure your system clock is accurate (required for TOTP)
+
+### Interactive login (CAPTCHA / MFA / email codes)
+
+The env-var login above is non-interactive, so it can't complete if Monarch responds with a Cloudflare CAPTCHA challenge, or an emailed one-time code (which can happen even with MFA disabled, for a new device/session). If that happens, authenticate once through one of these instead — the session is then saved and reused just like the env-var path:
+
+- **From your MCP client**: call the `monarch_login` tool (email/password, with an MFA/emailed-code follow-up if needed), or `monarch_login_with_cookies` if you're being CAPTCHA-blocked (paste the `cookie` request header from a logged-in browser session — DevTools → Network → any `api.monarch.com` request).
+- **From a terminal**, if you've cloned the repo: `uv run scripts/login_setup.py` — offers browser-cookie, email/password, and session-token paste options.
+
+Use `check_auth_status` to see whether a session is currently active.
 
 ## Development
 

@@ -143,41 +143,61 @@ class TestAuthenticationRetry:
             assert not mock_auth.called
 
     @pytest.mark.asyncio
-    async def test_initialize_client_loads_session_without_validation(self):
-        """Test that initialize_client loads existing sessions without validating them."""
+    async def test_initialize_client_loads_saved_session_without_login(self):
+        """Test that initialize_client reuses a saved session instead of logging in fresh.
+
+        The saved session may come from a plain env-var login, login_setup.py, or one
+        of the interactive monarch_login tools — initialize_client() doesn't care which;
+        it just prefers load_session_secure() over a fresh password login, since Monarch's
+        CAPTCHA/MFA/email-OTP gates can't always be satisfied headlessly.
+        """
+        import server
+
+        original_auth_state = server.auth_state
+        server.auth_state = server.AuthState.NOT_INITIALIZED
+
+        saved_client = MagicMock()
+
+        try:
+            with (
+                patch("server.load_session_secure", return_value=saved_client),
+                patch("server.MonarchMoney") as mock_mm_class,
+            ):
+                await server.initialize_client()
+
+                # The saved client became the active session...
+                assert server.mm_client is saved_client
+                assert server.auth_state == server.AuthState.AUTHENTICATED
+                # ...and no fresh client/login was attempted.
+                assert not mock_mm_class.called
+        finally:
+            server.auth_state = original_auth_state
+
+    @pytest.mark.asyncio
+    async def test_initialize_client_falls_back_to_login_when_no_saved_session(self):
+        """Test that initialize_client logs in fresh when no saved session exists."""
         import os
 
         import server
 
-        # Reset auth state before test
         original_auth_state = server.auth_state
         server.auth_state = server.AuthState.NOT_INITIALIZED
 
         try:
-            # Mock environment variables
             with (
                 patch.dict(os.environ, {"MONARCH_EMAIL": "test@example.com", "MONARCH_PASSWORD": "testpass"}),
-                patch("server.session_file") as mock_session_file,
+                patch("server.load_session_secure", return_value=None),
+                patch("server.save_session_secure"),
                 patch("server.MonarchMoney") as mock_mm_class,
             ):
-                # Setup: session file exists
-                mock_session_file.exists.return_value = True
-
-                # Mock the client
                 mock_client = AsyncMock()
                 mock_mm_class.return_value = mock_client
 
-                # Call initialize_client
                 await server.initialize_client()
 
-                # Verify that session was loaded (load_session called)
-                assert mock_client.load_session.called
-                # Verify that login was NOT called (we loaded existing session)
-                assert not mock_client.login.called
-                # Verify auth state is AUTHENTICATED after loading session
+                assert mock_client.login.called
                 assert server.auth_state == server.AuthState.AUTHENTICATED
         finally:
-            # Restore original state
             server.auth_state = original_auth_state
 
     def test_clear_session_removes_both_session_files(self):
@@ -198,6 +218,25 @@ class TestAuthenticationRetry:
 
             # Verify both files were attempted to be removed
             assert mock_custom_session.unlink.called
+
+    def test_clear_session_secure_clears_keyring_when_available(self):
+        """Test that clear_session_secure deletes the keyring entry when a backend is present."""
+        from server import clear_session_secure
+
+        with (
+            patch("server._keyring_available", return_value=True),
+            patch("server.session_file") as mock_session_file,
+            patch("server.session_dir") as mock_session_dir,
+        ):
+            mock_session_file.exists.return_value = False
+            mock_session_dir.__truediv__ = MagicMock(return_value=MagicMock(exists=MagicMock(return_value=False)))
+
+            with patch.dict("sys.modules", {"keyring": MagicMock()}):
+                import keyring
+
+                clear_session_secure(reason="test")
+
+                assert keyring.delete_password.called
 
     @pytest.mark.asyncio
     async def test_auth_error_indicators_comprehensive(self):
