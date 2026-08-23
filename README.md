@@ -138,6 +138,42 @@ Not sure how? Tell your agent:
 </details>
 
 <details>
+<summary><b>Docker (HTTP transport)</b></summary>
+
+For remote/self-hosted setups, the server can run in a container over Streamable HTTP instead of stdio:
+
+```bash
+docker build -t monarch-mcp .
+docker run -d --name monarch-mcp -p 8000:8000 \
+  -e MONARCH_EMAIL=your-email@example.com \
+  -e MONARCH_PASSWORD=your-password \
+  -e MONARCH_MFA_SECRET=your-mfa-secret-key \
+  -e MCP_HTTP_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  -v monarch-session:/home/monarch/.monarch-mcp \
+  monarch-mcp
+```
+
+Or `docker compose up --build` with the same env vars in a `.env` file (see [`docker-compose.yml`](docker-compose.yml)).
+
+The MCP endpoint is then `http://<host>:8000/mcp`. Point an HTTP-capable MCP client at it with an `Authorization: Bearer <token>` header matching `MCP_HTTP_AUTH_TOKEN`.
+
+> [!WARNING]
+> Always set `MCP_HTTP_AUTH_TOKEN`. Without it, anyone who can reach the container's host/port gets full read/write access to your Monarch Money account — there's no other auth on the HTTP transport. Only bind to `0.0.0.0` (the image's default) behind a firewall, VPN, or reverse proxy you control; never expose the port directly to the public internet, even with a token, without TLS in front of it (e.g. via a reverse proxy).
+
+Env vars specific to the HTTP transport:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MCP_TRANSPORT` | `http` in the image, `stdio` otherwise | Selects `stdio` or `http`/`streamable-http` |
+| `HOST` | `0.0.0.0` in the image, `127.0.0.1` otherwise | Bind address |
+| `PORT` | `8000` | Bind port |
+| `MCP_HTTP_AUTH_TOKEN` | unset | Shared-secret bearer token required on every request |
+
+The session file falls back to `/home/monarch/.monarch-mcp` inside the container (no OS keyring in Docker) — mount a volume there (as above) so you don't have to re-authenticate on every restart.
+
+</details>
+
+<details>
 <summary><b>From source (development)</b></summary>
 
 To run against a local checkout (and the git-pinned `monarchmoneycommunity` lib):

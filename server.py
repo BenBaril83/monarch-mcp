@@ -5,6 +5,7 @@ import asyncio
 import base64
 import contextlib
 import functools
+import hmac
 import io
 import json
 import logging
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
 
 import structlog
+import uvicorn
 from dateutil import parser as date_parser
 from dateutil.relativedelta import relativedelta
 from mcp.server.fastmcp import Context, FastMCP
@@ -36,6 +38,10 @@ from mcp.types import (
 )
 from monarchmoney import CaptchaRequiredException, LoginFailedException, MonarchMoney, RequireMFAException
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # Type definitions for Monarch Money API responses
 JsonSerializable = str | int | float | bool | None | list["JsonSerializable"] | dict[str, "JsonSerializable"]
@@ -2855,16 +2861,85 @@ async def check_auth_status() -> AuthResult:
     )
 
 
+MCP_HTTP_AUTH_TOKEN_ENV = "MCP_HTTP_AUTH_TOKEN"
+
+
+class BearerTokenAuthMiddleware:
+    """Rejects HTTP requests that don't present the configured bearer token.
+
+    The MCP SDK's built-in auth machinery (``TokenVerifier``/``AuthSettings``)
+    targets full OAuth resource servers and requires an issuer URL. This
+    server is single-tenant and self-hosted, so a single shared-secret
+    bearer token is all that's needed to keep it from being an open door to
+    full read/write access to the operator's Monarch Money account.
+    """
+
+    def __init__(self, app: ASGIApp, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        header = Request(scope, receive).headers.get("authorization", "")
+        presented = header.removeprefix("Bearer ") if header.startswith("Bearer ") else ""
+        if not presented or not hmac.compare_digest(presented, self.token):
+            response: Response = JSONResponse({"error": "unauthorized"}, status_code=401)
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+def build_http_app() -> Starlette:
+    """Build the Streamable HTTP ASGI app, gated by MCP_HTTP_AUTH_TOKEN if set."""
+    app = mcp.streamable_http_app()
+
+    token = os.getenv(MCP_HTTP_AUTH_TOKEN_ENV)
+    if token:
+        app.add_middleware(BearerTokenAuthMiddleware, token=token)
+    else:
+        log.warning(
+            "http_transport_unauthenticated",
+            hint=(
+                f"Set {MCP_HTTP_AUTH_TOKEN_ENV} to require a bearer token on every request — without it, "
+                "anyone who can reach this host/port gets full read/write access to your Monarch Money account."
+            ),
+        )
+    return app
+
+
+async def run_http_async() -> None:
+    """Serve the Streamable HTTP transport (for Docker / remote deployments) over uvicorn."""
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "8000"))
+    app = build_http_app()
+
+    log.info("server_starting_http", host=host, port=port, session_file=str(session_file))
+    config = uvicorn.Config(app, host=host, port=port, log_level=mcp.settings.log_level.lower())
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 async def main() -> None:
     """Main entry point for the server.
 
     The server starts immediately without authentication. Authentication
     happens lazily on the first tool call via ensure_authenticated().
+
+    Transport is selected via MCP_TRANSPORT ("stdio", the default, or
+    "http"/"streamable-http" for the Docker-friendly HTTP transport).
     """
-    log.info("server_starting", session_file=str(session_file), auth_state=auth_state.value)
+    transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
 
     try:
-        await mcp.run_stdio_async()
+        if transport in ("http", "streamable-http"):
+            await run_http_async()
+        else:
+            log.info("server_starting", session_file=str(session_file), auth_state=auth_state.value)
+            await mcp.run_stdio_async()
     except (BrokenPipeError, ConnectionResetError):
         log.info("client_disconnected")
     except KeyboardInterrupt:
