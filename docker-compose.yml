@@ -1,0 +1,16 @@
+services:
+  monarch-mcp:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MONARCH_EMAIL: ${MONARCH_EMAIL}
+      MONARCH_PASSWORD: ${MONARCH_PASSWORD}
+      MONARCH_MFA_SECRET: ${MONARCH_MFA_SECRET}
+      MCP_HTTP_AUTH_TOKEN: ${MCP_HTTP_AUTH_TOKEN}
+    volumes:
+      - monarch-session:/home/monarch/.monarch-mcp
+    restart: unless-stopped
+
+volumes:
+  monarch-session:
