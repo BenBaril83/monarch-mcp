@@ -8,6 +8,8 @@ services:
       MONARCH_PASSWORD: ${MONARCH_PASSWORD}
       MONARCH_MFA_SECRET: ${MONARCH_MFA_SECRET}
       MCP_HTTP_AUTH_TOKEN: ${MCP_HTTP_AUTH_TOKEN}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
     volumes:
       - monarch-session:/home/monarch/.monarch-mcp
     restart: unless-stopped
