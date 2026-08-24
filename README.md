@@ -168,8 +168,19 @@ Env vars specific to the HTTP transport:
 | `HOST` | `0.0.0.0` in the image, `127.0.0.1` otherwise | Bind address |
 | `PORT` | `8000` | Bind port |
 | `MCP_HTTP_AUTH_TOKEN` | unset | Shared-secret bearer token required on every request |
+| `MCP_ALLOWED_HOSTS` | unset | Comma-separated extra `Host` header values to allow (see below) |
+| `MCP_ALLOWED_ORIGINS` | unset | Comma-separated extra `Origin` header values to allow (see below) |
 
 The session file falls back to `/home/monarch/.monarch-mcp` inside the container (no OS keyring in Docker) — mount a volume there (as above) so you don't have to re-authenticate on every restart.
+
+**Behind a reverse proxy (Cloudflare Tunnel, nginx, etc.):** the MCP SDK's Streamable HTTP transport has its own DNS-rebinding protection that only allows `Host: localhost`/`127.0.0.1`/`[::1]` by default — nothing to do with trusted-proxy/forwarded-header config. A request arriving with any other `Host` header (e.g. your public hostname) gets rejected with `421 Invalid Host header`. Set `MCP_ALLOWED_HOSTS` to the hostname(s) your proxy forwards, and `MCP_ALLOWED_ORIGINS` too if your client sends an `Origin` header:
+
+```bash
+-e MCP_ALLOWED_HOSTS="mcp.example.com" \
+-e MCP_ALLOWED_ORIGINS="https://mcp.example.com" \
+```
+
+Both accept a trailing `:*` to allow any port (e.g. `mcp.example.com:*`), and localhost access keeps working alongside whatever you add.
 
 </details>
 
