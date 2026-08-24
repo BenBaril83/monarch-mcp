@@ -1,6 +1,7 @@
 """Tests for the optional Streamable HTTP transport and its bearer-token auth gate."""
 
 import pytest
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -55,3 +56,41 @@ class TestBuildHttpApp:
         app = server.build_http_app()
 
         assert not any(mw.cls is server.BearerTokenAuthMiddleware for mw in app.user_middleware)
+
+
+class TestConfigureTransportSecurity:
+    def test_noop_when_no_extra_hosts_or_origins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
+        monkeypatch.delenv("MCP_ALLOWED_ORIGINS", raising=False)
+        original = server.mcp.settings.transport_security
+
+        server._configure_transport_security()
+
+        assert server.mcp.settings.transport_security is original
+
+    def test_extends_allowed_hosts_and_origins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            server.mcp.settings,
+            "transport_security",
+            TransportSecuritySettings(allowed_hosts=["localhost:*"], allowed_origins=["http://localhost:*"]),
+        )
+        monkeypatch.setenv("MCP_ALLOWED_HOSTS", "mcp.example.com, mcp.example.com:*")
+        monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://mcp.example.com")
+
+        server._configure_transport_security()
+
+        security = server.mcp.settings.transport_security
+        assert security is not None
+        assert security.allowed_hosts == ["localhost:*", "mcp.example.com", "mcp.example.com:*"]
+        assert security.allowed_origins == ["http://localhost:*", "https://mcp.example.com"]
+
+    def test_creates_settings_when_none_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server.mcp.settings, "transport_security", None)
+        monkeypatch.setenv("MCP_ALLOWED_HOSTS", "mcp.example.com")
+        monkeypatch.delenv("MCP_ALLOWED_ORIGINS", raising=False)
+
+        server._configure_transport_security()
+
+        security = server.mcp.settings.transport_security
+        assert security is not None
+        assert security.allowed_hosts == ["mcp.example.com"]

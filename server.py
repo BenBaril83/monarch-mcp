@@ -28,6 +28,7 @@ import uvicorn
 from dateutil import parser as date_parser
 from dateutil.relativedelta import relativedelta
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import (
     Completion,
     CompletionArgument,
@@ -2893,8 +2894,29 @@ class BearerTokenAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+def _configure_transport_security() -> None:
+    """Extend the Streamable HTTP transport's Host/Origin allowlist for reverse proxies.
+
+    FastMCP's built-in DNS-rebinding protection only allows `localhost`/`127.0.0.1`/`[::1]`
+    Host headers by default, so any request arriving through a reverse proxy (Cloudflare
+    Tunnel, nginx, etc.) is rejected with a 421 "Invalid Host header" — the proxy's public
+    hostname isn't on that allowlist. MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS (comma-separated)
+    extend it rather than replace it, so localhost access keeps working alongside the proxy.
+    """
+    extra_hosts = [h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    extra_origins = [o.strip() for o in os.getenv("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    if not extra_hosts and not extra_origins:
+        return
+
+    security = mcp.settings.transport_security or TransportSecuritySettings()
+    security.allowed_hosts = [*security.allowed_hosts, *extra_hosts]
+    security.allowed_origins = [*security.allowed_origins, *extra_origins]
+    mcp.settings.transport_security = security
+
+
 def build_http_app() -> Starlette:
     """Build the Streamable HTTP ASGI app, gated by MCP_HTTP_AUTH_TOKEN if set."""
+    _configure_transport_security()
     app = mcp.streamable_http_app()
 
     token = os.getenv(MCP_HTTP_AUTH_TOKEN_ENV)
